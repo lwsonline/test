@@ -1,0 +1,1969 @@
+//+------------------------------------------------------------------+
+//|                                                        Black Box |
+//|                                        Copyright 2023, Black Box |
+//|                                                                  |
+//+------------------------------------------------------------------+
+
+#include <Trade/Trade.mqh>
+#include <GetSuppResPoints.mqh>
+#include <Expert/Expert.mqh>
+#include <Indicators/Indicators.mqh>
+#include <Math/Stat/Math.mqh>
+#include "Neural.mqh"
+#include <ChartObjects\ChartObjectsTxtControls.mqh>
+#include <Object.mqh>
+
+CTrade Trade;
+
+input group "Main"
+
+input int RegularDRSessionStart = 1630;
+input int RegularDRSessionEnd = 1730;
+input int RegularDRTradeEnd = 2300;
+
+input int EveningDRSessionStart = 230;
+input int EveningDRSessionEnd = 330;
+input int EveningDRTradeEnd = 900;
+
+input int OvernightDRSessionStart = 1000;
+input int OvernightDRSessionEnd = 1100;
+input int OvernightDRTradeEnd = 1530;
+
+input int HourOffset = 0;
+
+input double StopLoss = 100;
+input double TakeProfit = 300;
+input double TrailingStopPips = 50;
+input group "Money management"
+//input double Lots = 0.01;
+input int dynamicSL = 0;
+input double volatilityMultipler = 1;
+input int volPeriod = 50;//50;
+input group "Miscellaneous"
+input int Slippage = 3;
+input int RsiPeriod = 14;
+input double RsiMin = 20;
+input double RsiMax = 80;
+input double CCI_ThresholdMax = 100;
+input double CCI_ThresholdMin = -100;
+input double StochOverbought = 95;
+input double StochOversold = 5;
+//input double ADX_Threshold = 25;
+input int MFI_Period = 14;             // Money Flow Index Period
+input double MFI_Overbought_Level = 80.0;  // Overbought level
+input double MFI_Oversold_Level = 20.0;    // Oversold level
+input double AtrThreshold = 10;
+input string Commentary = "Black Box";
+input bool ShowBoxes = true;
+input bool ShowTradeEnd = true;
+input double RiskPercentage = 1.0; // Risk percentage for total open positions (0.1 - 100.0)
+input double RiskPercentagePerTrade = 0.5; // Risk percentage per trade (0.1 - 100.0)
+input double Neural_learning_rate = 0.01;   // Define the Learning rate for updating the network
+input double MaxDrawDown = -100.0;
+input double MaxDrawUp = 100.0;
+
+// Magic numbers for different strategies
+input int Magic = 3;
+
+//--- input parameters
+input int      ExtDepth = 12;          //ZigZag Depth
+input int      ExtDeviation = 5;       //ZigZag Deviation
+input int      ExtBackStep = 3;        //ZigZag BackStep
+input int      SafetyBuffer = 1;       //Next bar close distance from level (points)
+input int      TrendPrecision = -5;    //Next to previous high(low) distance
+input int      CloseBarPause = 5;      //Pause from close to trade (bars)
+input color    LevelColor = clrBlue;  //Fibo levels colors
+
+
+int            ZZ_Handle;
+int            TrendDirection;
+int            CopyNumber;
+long           PositionID;
+double         ZZ_Buffer[];
+
+double        Fibo[7];
+double         SymbolTickValue;
+datetime       CloseBarTime;
+double HL[50] = {0}; // High Low array to store the price of the last 50 extremum points
+datetime HL_Time[50] = {0}; // Time array to store the time of the last 50 extremum points
+datetime       Time00;
+datetime       Time100;
+bool           PositionChangeFlag;
+
+MqlTradeResult  Results = {0};
+MqlRates RatesArray[];
+
+
+// Global variables
+// number of trades processed
+int tradeCount = 0;
+// track the number of profitable trades
+int profitableTradeCount = 0;
+
+datetime LastEntryTime = 0;
+int OrderTaken = 0;
+ENUM_SYMBOL_TRADE_EXECUTION Execution_Mode;
+double Poin;
+int Deviation = 3;
+double volFactor;
+int OrderSelectByMagic;
+double closePrice;
+int SELECT_BY_TICKET = 0;
+
+double DR_high;
+double DR_low;
+double IDR_high;
+double IDR_low;
+
+#define STO_HIGH_LOW 2
+#define MODE_UPPER 0
+#define MODE_LOWER 1
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+datetime TimeToDt(int hours, int minutes, int seconds)
+  {
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(),dt);
+   dt.sec = seconds;
+   dt.min = minutes;
+   dt.hour = hours;
+   return StructToTime(dt)+3600*HourOffset;
+
+  }
+
+// Function to get total number of orders
+int GetOrdersTotal()
+  {
+   int totalOrders = OrdersTotal();
+   return totalOrders;
+  }
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+double GetAccountBalance()
+  {
+   return AccountInfoDouble(ACCOUNT_BALANCE);
+  }
+// OrderProfit function
+double OrderProfit()
+  {
+// Get the profit of the current order
+   if(OrderSelect(0, SELECT_BY_POS, MODE_TRADES))
+      return ::OrderProfit();
+   else
+      return 0;
+  }
+
+// OrderMagicNumber function
+int OrderMagicNumber()
+  {
+// Get the magic number of the current order
+   if(OrderSelect(0, SELECT_BY_POS, MODE_TRADES))
+      return ::OrderMagicNumber();
+   else
+      return 0;
+  }
+
+// OrderCommission function
+double OrderCommission()
+  {
+// Get the commission of the current order
+   if(OrderSelect(0, SELECT_BY_POS, MODE_TRADES))
+      return ::OrderCommission();
+   else
+      return 0;
+  }
+
+// OrderSwap function
+double OrderSwap()
+  {
+// Get the swap of the current order
+   if(OrderSelect(0, SELECT_BY_POS, MODE_TRADES))
+      return ::OrderSwap();
+   else
+      return 0;
+  }
+// OrderClose function
+bool OrderClose(int ticket, double lots, double price, int slippage, color arrow_color)
+  {
+// Check if order is still open
+   if(OrderSelect(ticket))
+     {
+      // Close the order
+      if(OrderClose(OrderTicket(), OrderLots(), NormalizeDouble(price, Digits()), slippage, arrow_color))
+         return true;
+     }
+
+   return false;
+  }
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+bool OrderSelect(int index, int select, int pool)
+  {
+   int result = ::OrderSelect(index, select, pool);
+   if(result == false)
+     {
+      return false;
+     }
+   return true;
+  }
+// OrderTicket function
+int OrderTicket()
+  {
+// Get the ticket of the current order
+   if(OrderSelect(0, SELECT_BY_POS, MODE_TRADES))
+      return OrderTicket();
+   else
+      return 0;
+  }
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+double OrderLots()
+  {
+// Declare a variable to store the number of lots of the current order
+   double lots;
+// Get the number of lots of the current order
+   ENUM_ORDER_TYPE type = OrderType();
+   if(type == ORDER_TYPE_BUY || type == ORDER_TYPE_SELL)
+     {
+      lots = OrderLots();
+     }
+   else
+     {
+      lots = 0;
+     }
+// Return the number of lots of the current order
+   return lots;
+  }
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+double CalculateLotSize()
+  {
+   double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double maxTotalRiskAmount = (RiskPercentage / 100.0) * accountBalance;
+   double riskAmountPerTrade = (RiskPercentagePerTrade / 100.0) * accountBalance;
+   double currentTotalRiskAmount = CalculateTotalRisk();
+
+   double availableRiskAmount = maxTotalRiskAmount - currentTotalRiskAmount;
+   if(availableRiskAmount <= 0)
+     {
+      return 0; // No available risk, do not open new positions
+     }
+
+// Choose the smaller risk amount between availableRiskAmount and riskAmountPerTrade
+   double stopLossInMoney = MathMin(availableRiskAmount, riskAmountPerTrade) / 100;
+
+   double pointValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+
+   double lotSize = stopLossInMoney / pointValue;
+   lotSize = MathRound(lotSize * 100) * 0.01;
+
+   if(lotSize < minLot)
+     {
+      lotSize = minLot;
+     }
+   else
+      if(lotSize > maxLot)
+        {
+         lotSize = maxLot;
+        }
+
+   return lotSize;
+  }
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+double CalculateTotalRisk()
+  {
+   double totalRisk = 0.0;
+   double pointValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionGetString(POSITION_SYMBOL) == _Symbol)
+        {
+         double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+         double stopLoss = PositionGetDouble(POSITION_SL);
+         double positionSize = PositionGetDouble(POSITION_VOLUME);
+         if(stopLoss > 0)
+           {
+            double positionRisk = MathAbs(openPrice - stopLoss) * positionSize * pointValue / tickSize;
+            totalRisk += positionRisk;
+           }
+        }
+     }
+   return totalRisk;
+  }
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+double OrderClosePrice()
+  {
+   int ticket = OrderTicket();
+
+   if(OrderSelect(ticket, SELECT_BY_TICKET, MODE_TRADES))
+     {
+      closePrice = ::OrderClosePrice();
+     }
+   return closePrice;
+  }
+
+const int MODE_TRADES = 0;
+const int SELECT_BY_POS = 1;
+
+#define MODE_TRADES 0
+#define SELECT_BY_POS 1
+#define MODE_HISTORY 2
+#define SELECT_BY_TICKET 3
+
+//check for trend in higher time frames
+int GetTrend(string symbol, ENUM_TIMEFRAMES tf)
+  {
+   int trend = 0;
+   double high = iHigh(symbol,tf,0);
+   double low = iLow(symbol,tf,0);
+   double high2 = iHigh(symbol,tf,1);
+   double low2 = iLow(symbol,tf,1);
+   if(high > high2 && low > low2)
+      trend = 1;
+   else
+      if(high < high2 && low < low2)
+         trend = -1;
+   return trend;
+  }
+
+const int OP_BUY = 0;
+const int OP_SELL = 1;
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+ENUM_ORDER_TYPE OrderType()
+  {
+   return OrderType();
+  }
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+void OnInit()
+  {
+   init_network();
+   Trade.SetExpertMagicNumber(Magic);
+
+   if((_Point == 0.00001) || (_Point == 0.001))
+     {
+      Poin = _Point * 3;
+      Deviation = Slippage * 3;
+     }
+   else
+     {
+      Poin = _Point;
+      Deviation = Slippage;
+     }
+
+   volFactor = GetVolatilityFactor(volPeriod);
+   Trade.SetDeviationInPoints(Deviation);
+   EventSetTimer(1);
+
+   ZZ_Handle = iCustom(Symbol(), PERIOD_CURRENT, "Examples\\ZigZag", ExtDepth, ExtDeviation, ExtBackStep);
+   Print("CustomIndicatorHandle ", ZZ_Handle);
+   if(ZZ_Handle <= 0)
+     {
+      Print("Indicator Handle Unsuccessful. Error #", GetLastError());
+     }
+   HL[0] = 666;
+   for(int i = 0; i < 50; i++)
+     {
+      HL[i] = 0;
+      HL_Time[i] = 0;
+     }
+  }
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+void  OnDeinit(
+   const int  reason         // deinitialization reason code
+)
+
+  {
+//---
+   if(reason!=REASON_CHARTCHANGE)
+     {
+      ObjectsDeleteAll(0,"calcbox");
+      ObjectsDeleteAll(0,"tradeend");
+     }
+
+  }
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+double CopyBufferMQL5(int handle,int index,int shift)
+  {
+   double buf[];
+   switch(index)
+     {
+      case 0:
+         if(CopyBuffer(handle,0,shift,1,buf)>0)
+            return(buf[0]);
+         break;
+      case 1:
+         if(CopyBuffer(handle,1,shift,1,buf)>0)
+            return(buf[0]);
+         break;
+      case 2:
+         if(CopyBuffer(handle,2,shift,1,buf)>0)
+            return(buf[0]);
+         break;
+      case 3:
+         if(CopyBuffer(handle,3,shift,1,buf)>0)
+            return(buf[0]);
+         break;
+      case 4:
+         if(CopyBuffer(handle,4,shift,1,buf)>0)
+            return(buf[0]);
+         break;
+      default:
+         break;
+     }
+   return(EMPTY_VALUE);
+  }
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+double iMAMQL5(string symbol,
+               ENUM_TIMEFRAMES timeframe,
+               int period,
+               int ma_shift,
+               ENUM_MA_METHOD ma_method,
+               ENUM_APPLIED_PRICE applied_price,
+               int shift)
+  {
+
+
+   int handle=iMA(symbol,timeframe,period,ma_shift,
+                  ma_method,applied_price);
+   if(handle<0)
+     {
+      Print("The iMA object is not created: Error",GetLastError());
+      return(-1);
+     }
+   else
+      return(CopyBufferMQL5(handle,0,shift));
+  }
+
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+double iRSIMQL5(string symbol,
+                ENUM_TIMEFRAMES timeframe,
+                int period,
+                ENUM_APPLIED_PRICE applied_price,
+                int shift)
+  {
+
+   int handle=iRSI(symbol,timeframe,period,applied_price);
+   if(handle<0)
+     {
+      Print("The iRSI object is not created: Error",GetLastError());
+      return(-1);
+     }
+   else
+      return(CopyBufferMQL5(handle,0,shift));
+  }
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+double iStochMQL5(string symbol,
+                  ENUM_TIMEFRAMES timeframe,
+                  int period_K,
+                  int period_D,
+                  int slowing,
+                  ENUM_MA_METHOD ma_method,
+                  ENUM_STO_PRICE price_field,
+                  int line_index,
+                  int shift)
+  {
+
+   int handle = iStochastic(symbol, timeframe, period_K, period_D, slowing, ma_method, price_field);
+   if(handle < 0)
+     {
+      Print("The iStochastic object is not created: Error", GetLastError());
+      return(-1);
+     }
+   else
+      return(CopyBufferMQL5(handle, line_index, shift));
+  }
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+double iATRMQL5(string symbol,
+                ENUM_TIMEFRAMES timeframe,
+                int period,
+                int shift)
+  {
+   int handle = iATR(symbol, timeframe, period);
+   if(handle < 0)
+     {
+      Print("The iATR object is not created: Error", GetLastError());
+      return (-1);
+     }
+   else
+      return (CopyBufferMQL5(handle, 0, shift));
+  }
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+double iMACDMQL5(string symbol,
+                 ENUM_TIMEFRAMES timeframe,
+                 int fast_ema_period,
+                 int slow_ema_period,
+                 int signal_period,
+                 ENUM_APPLIED_PRICE applied_price,
+                 int line_index,
+                 int shift)
+  {
+   int handle = iMACD(symbol, timeframe, fast_ema_period, slow_ema_period, signal_period, applied_price);
+   if(handle < 0)
+     {
+      Print("The iMACD object is not created: Error", GetLastError());
+      return(-1);
+     }
+   else
+      return(CopyBufferMQL5(handle, line_index, shift));
+  }
+// Custom function to get CCI values from buffer
+double iCCIMQL5(string symbol, ENUM_TIMEFRAMES timeframe, int period, int shift)
+  {
+   int handle = iCCI(symbol, timeframe, period, PRICE_TYPICAL);
+   if(handle < 0)
+     {
+      Print("The iCCI object is not created: Error", GetLastError());
+      return (-1);
+     }
+   else
+      return (CopyBufferMQL5(handle, 0, shift));
+  }
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+double iACMQL5(string symbol,
+               ENUM_TIMEFRAMES timeframe,
+               int shift)
+  {
+   int handle = iAC(symbol, timeframe);
+   if(handle < 0)
+     {
+      Print("The iAC object is not created: Error", GetLastError());
+      return (-1);
+     }
+   else
+      return (CopyBufferMQL5(handle, 0, shift));
+  }
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+double iAOMQL5(string symbol,
+               ENUM_TIMEFRAMES timeframe,
+               int shift)
+  {
+   int handle = iAO(symbol, timeframe);
+   if(handle < 0)
+     {
+      Print("The iAO object is not created: Error", GetLastError());
+      return (-1);
+     }
+   else
+      return (CopyBufferMQL5(handle, 0, shift));
+  }
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+void GetHeikinAshiCloses(double & haClose[])
+  {
+   double haOpenprev = iOpen(_Symbol, PERIOD_M5, 5);
+   double haCloseprev = (iClose(_Symbol, PERIOD_M5, 5)+iOpen(_Symbol, PERIOD_M5, 5)+iHigh(_Symbol, PERIOD_M5, 5)
+                         + iLow(_Symbol, PERIOD_M5, 5))/4;
+   for(int i=4; i>=0; i--)
+     {
+      double haOpenVal = (haOpenprev + haCloseprev) / 2.0;
+      double HighVal = iHigh(_Symbol, PERIOD_M5, i);
+      double LowVal = iLow(_Symbol, PERIOD_M5, i);
+      double OpenVal = iOpen(_Symbol, PERIOD_M5, i);
+      haClose[i] = (OpenVal + HighVal + LowVal + iClose(_Symbol, PERIOD_M5, i)) / 4.0;
+      haOpenprev = haOpenVal;
+      haCloseprev = haClose[i];
+     }
+  }
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+double AdaptiveEMA(string symbol,
+                   ENUM_TIMEFRAMES timeframe,
+                   int period,
+                   int ma_shift,
+                   ENUM_MA_METHOD ma_method,
+                   ENUM_APPLIED_PRICE applied_price,
+                   int shift,
+                   double alphaMin,
+                   double alphaMax,
+                   double weight)
+  {
+   double volatilityFactor = GetVolatilityFactor(period);
+   double rateOfChange = GetRateOfChange(symbol, timeframe, period, applied_price, shift);
+   double dominantCycle = GetDominantCycle(symbol, timeframe, applied_price, shift);
+
+   double alpha = alphaMin + (alphaMax - alphaMin) * (1 - (volatilityFactor / 100) * weight * rateOfChange * dominantCycle);
+
+   if(alpha < alphaMin)
+      alpha = alphaMin;
+   if(alpha > alphaMax)
+      alpha = alphaMax;
+
+// Calculate the EMA using the adjusted alpha (smoothing factor)
+   double prevEMA = iMAMQL5(symbol, timeframe, period, ma_shift, ma_method, applied_price, shift + 1);
+   double price = iMAMQL5(symbol, timeframe, 1, 0, MODE_SMMA, applied_price, shift); // Get the current price
+   double adaptiveEMA = alpha * (price - prevEMA) + prevEMA;
+
+   return adaptiveEMA;
+  }
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+double GetRateOfChange(string symbol, ENUM_TIMEFRAMES timeframe, int period, ENUM_APPLIED_PRICE applied_price, int shift)
+  {
+   double previousPrice = iMAMQL5(symbol, timeframe, 1, 0, MODE_SMMA, applied_price, shift + period);
+   double currentPrice = iMAMQL5(symbol, timeframe, 1, 0, MODE_SMMA, applied_price, shift);
+   return (currentPrice - previousPrice) / previousPrice;
+  }
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+double GetDominantCycle(string symbol, ENUM_TIMEFRAMES timeframe, ENUM_APPLIED_PRICE applied_price, int shift)
+  {
+   int period = 14; // You may need to optimize this value for different assets and timeframes.
+   double smaPeriod = iMAMQL5(symbol, timeframe, period, 0, MODE_SMA, applied_price, shift);
+   return smaPeriod;
+  }
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+// Struct to hold trade information
+struct TradeInfo
+  {
+   bool              profitable;
+   double            entryPrice;
+   double            exitPrice;
+  };
+
+// Function to evaluate trade profitability
+TradeInfo evaluateTrade(bool predicted_buy, bool predicted_sell, double& entryPrice, double& exitPrice)
+  {
+
+   TradeInfo tradeInfo;
+
+   entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+   exitPrice = PositionGetDouble(POSITION_PRICE_CURRENT);
+
+   tradeInfo.entryPrice = entryPrice;
+   tradeInfo.exitPrice = exitPrice;
+
+// Check if the trade is profitable based on the position's type
+   if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+     {
+      tradeInfo.profitable = tradeInfo.exitPrice > tradeInfo.entryPrice;
+     }
+   else
+      if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+        {
+         tradeInfo.profitable = tradeInfo.exitPrice < tradeInfo.entryPrice;
+        }
+      else
+        {
+         // Invalid position type
+         tradeInfo.profitable = false;
+        }
+
+   return tradeInfo;
+  }
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+double GetMoneyFlowIndex(int period, datetime time)
+  {
+   MqlRates rates[];
+   double moneyFlowPositive = 0.0;
+   double moneyFlowNegative = 0.0;
+
+// Retrieve OHLC data for the specified period
+   int rates_count = CopyRates(_Symbol, _Period, time - _Period * PeriodSeconds(), period, rates);
+
+// Calculate the money flow for each candle
+   for(int i = 1; i < rates_count; i++)
+     {
+      double typicalPrice = (rates[i].high + rates[i].low + rates[i].close) / 3.0;
+      double previousTypicalPrice = (rates[i - 1].high + rates[i - 1].low + rates[i - 1].close) / 3.0;
+      long candleVolume = rates[i].tick_volume;
+
+
+      if(typicalPrice > previousTypicalPrice)
+        {
+         moneyFlowPositive += typicalPrice * candleVolume;
+        }
+      else
+        {
+         moneyFlowNegative += typicalPrice * candleVolume;
+        }
+     }
+
+// Calculate the money flow ratio
+   double moneyFlowRatio = moneyFlowPositive / moneyFlowNegative;
+
+// Calculate the Money Flow Index
+   double moneyFlowIndex = 100 - (100 / (1 + moneyFlowRatio));
+
+   return moneyFlowIndex;
+  }
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+
+int olds = -1;
+//+------------------------------------------------------------------+
+//|                             OnTick()                              |
+//+------------------------------------------------------------------+
+// Fibonacci level variables
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+void OnTick()
+  {
+// Call some functions
+   DoSLTP();
+   ClosePositionSecurity();
+// Fibonacci level variables
+// Declare the Fibonacci level variables inside OnTick
+   double Fibo100 = 0;
+   double Fibo23 = 0;
+   double Fibo38 = 0;
+   double Fibo61 = 0;
+   double Fibo76 = 0;
+   double Fibo00 = 0;
+   double FiboBASE = 0;
+
+// create new Fibonacci levels
+   FiboCreate(Fibo100, Fibo23, Fibo38, Fibo61, Fibo76, Fibo00, FiboBASE);
+   OpenPositions(Fibo100, Fibo23, Fibo38, Fibo61, Fibo76, Fibo00, FiboBASE);
+
+
+   int s = GetSession();
+// Get the high and low of the 5-minute timeframe
+   if(s!=olds)
+     {
+      Print("session:",s);
+      olds = s;
+     }
+
+   if(s<0)
+      return;
+
+   if(ShowTradeEnd)
+     {
+      VLineCreate(0,"tradeend"+tradesessionend,0,tradesessionend,clrRed);
+     }
+
+   if(s==0)
+     {
+      GetDR(RegularDRSessionStart,RegularDRSessionEnd);
+     }
+   if(s==1)
+     {
+      GetDR(EveningDRSessionStart,EveningDRSessionEnd);
+     }
+   if(s==2)
+     {
+      GetDR(OvernightDRSessionStart,OvernightDRSessionEnd);
+     }
+// Declare the variables outside of the if statements
+   bool predicted_buy = false;
+   bool predicted_sell = false;
+   double entryPrice = 0.0;
+   double exitPrice = 0.0;
+
+   double DRClose[5];
+   int b = iBarShift(Symbol(),PERIOD_M5,closecheck);
+   datetime btime = iTime(Symbol(),PERIOD_M5,b);
+   if(btime!=closecheck || b<1)
+      return;
+
+   for(int i=1; i<6; i++)
+     {
+      DRClose[i-1] = iClose(_Symbol, PERIOD_M5, i);
+     }
+//Print(closecheck);
+//  idr.GetNewYork();
+
+// Get the current market trend
+   int trendM1 = GetTrend(_Symbol, PERIOD_M1);
+   int trendM5 = GetTrend(_Symbol, PERIOD_M5);
+   int trendM15 = GetTrend(_Symbol, PERIOD_M15);
+   int trendM30 = GetTrend(_Symbol, PERIOD_M30);
+   int trendH1 = GetTrend(_Symbol, PERIOD_H1);
+   int trendH4 = GetTrend(_Symbol, PERIOD_H4);
+   int trendD1 = GetTrend(_Symbol, PERIOD_D1);
+
+   int BB_Period = 20;
+   int BB_Deviation = 2;
+
+// Get the fast and slow MA
+   double D1fastMA = iMAMQL5(NULL, PERIOD_D1, 50, 0, MODE_EMA, PRICE_CLOSE,1);
+   double D1slowMA = iMAMQL5(NULL, PERIOD_D1, 200, 0, MODE_EMA, PRICE_CLOSE,1);
+
+   double H12fastMA = iMAMQL5(NULL, PERIOD_H12, 50, 0, MODE_EMA, PRICE_CLOSE,1);
+   double H12slowMA = iMAMQL5(NULL, PERIOD_H12, 200, 0, MODE_EMA, PRICE_CLOSE,1);
+   double H8fastMA = iMAMQL5(NULL, PERIOD_H8, 50, 0, MODE_EMA, PRICE_CLOSE,1);
+   double H8slowMA = iMAMQL5(NULL, PERIOD_H8, 200, 0, MODE_EMA, PRICE_CLOSE,1);
+
+   double H4fastMA = iMAMQL5(NULL, PERIOD_H4, 50, 0, MODE_EMA, PRICE_CLOSE,1);
+   double H4slowMA = iMAMQL5(NULL, PERIOD_H4, 200, 0, MODE_EMA, PRICE_CLOSE,1);
+
+   double H1fastMA = iMAMQL5(NULL, PERIOD_H1, 50, 0, MODE_EMA, PRICE_CLOSE,1);
+   double H1slowMA = iMAMQL5(NULL, PERIOD_H1, 200, 0, MODE_EMA, PRICE_CLOSE,1);
+
+   double M30fastMA = iMAMQL5(NULL, PERIOD_M30, 50, 0, MODE_EMA, PRICE_CLOSE,1);
+   double M30slowMA = iMAMQL5(NULL, PERIOD_M30, 200, 0, MODE_EMA, PRICE_CLOSE,1);
+   double prevM30fastMA = iMAMQL5(NULL, PERIOD_M30, 50, 1, MODE_EMA, PRICE_CLOSE, 0);
+   double prevM30slowMA = iMAMQL5(NULL, PERIOD_M30, 200, 1, MODE_EMA, PRICE_CLOSE, 0);
+
+   double M15fastMA = iMAMQL5(NULL, PERIOD_M15, 50, 0, MODE_EMA, PRICE_CLOSE,1);
+   double M15slowMA = iMAMQL5(NULL, PERIOD_M15, 200, 0, MODE_EMA, PRICE_CLOSE,1);
+   double M5fastMA = iMAMQL5(NULL, PERIOD_M5, 50, 0, MODE_EMA, PRICE_CLOSE,1);
+   double M5slowMA = iMAMQL5(NULL, PERIOD_M5, 200, 0, MODE_EMA, PRICE_CLOSE,1);
+   double M1fastMA = iMAMQL5(NULL, PERIOD_M1, 50, 0, MODE_EMA, PRICE_CLOSE,1);
+   double M1slowMA = iMAMQL5(NULL, PERIOD_M1, 200, 0, MODE_EMA, PRICE_CLOSE,1);
+
+   double W1fastMA_short_term = iMAMQL5(NULL, PERIOD_W1, 20, 0, MODE_EMA, PRICE_CLOSE,1);
+   double W1slowMA_short_term = iMAMQL5(NULL, PERIOD_W1, 100, 0, MODE_EMA, PRICE_CLOSE,1);
+   double D1fastMA_short_term = iMAMQL5(NULL, PERIOD_D1, 20, 0, MODE_EMA, PRICE_CLOSE,1);
+   double D1slowMA_short_term = iMAMQL5(NULL, PERIOD_D1, 100, 0, MODE_EMA, PRICE_CLOSE,1);
+   double H4fastMA_short_term = iMAMQL5(NULL, PERIOD_H4, 20, 0, MODE_EMA, PRICE_CLOSE,1);
+   double H4slowMA_short_term = iMAMQL5(NULL, PERIOD_H4, 100, 0, MODE_EMA, PRICE_CLOSE,1);
+
+
+   double M15fastMA_short_term = iMAMQL5(NULL, PERIOD_M15, 10, 0, MODE_EMA, PRICE_CLOSE,1);
+   double M15slowMA_short_term = iMAMQL5(NULL, PERIOD_M15, 20, 0, MODE_EMA, PRICE_CLOSE,1);
+   double M5fastMA_short_term = iMAMQL5(NULL, PERIOD_M5, 10, 0, MODE_EMA, PRICE_CLOSE,1);
+   double M5slowMA_short_term = iMAMQL5(NULL, PERIOD_M5, 20, 0, MODE_EMA, PRICE_CLOSE,1);
+   double M1fastMA_short_term = iMAMQL5(NULL, PERIOD_M1, 10, 0, MODE_EMA, PRICE_CLOSE,1);
+   double M1slowMA_short_term = iMAMQL5(NULL, PERIOD_M1, 20, 0, MODE_EMA, PRICE_CLOSE,1);
+
+   if(W1fastMA_short_term==EMPTY_VALUE)  // no data yet
+      return;
+
+// Calculate additional indicators
+   double W1_RSI = iRSIMQL5(_Symbol, PERIOD_W1, RsiPeriod, PRICE_WEIGHTED,1);
+   double D1_RSI = iRSIMQL5(_Symbol, PERIOD_D1, RsiPeriod, PRICE_WEIGHTED,1);
+   double H12_RSI = iRSIMQL5(_Symbol, PERIOD_H12, RsiPeriod, PRICE_WEIGHTED,1);
+   double H8_RSI = iRSIMQL5(_Symbol, PERIOD_H8, RsiPeriod, PRICE_WEIGHTED,1);
+   double H4_RSI = iRSIMQL5(_Symbol, PERIOD_H4, RsiPeriod, PRICE_WEIGHTED,1);
+   double H1_RSI = iRSIMQL5(_Symbol, PERIOD_H1, RsiPeriod, PRICE_WEIGHTED,1);
+   double M30_RSI = iRSIMQL5(_Symbol, PERIOD_M30, RsiPeriod, PRICE_WEIGHTED,1);
+   double M15_RSI = iRSIMQL5(_Symbol, PERIOD_M15, RsiPeriod, PRICE_WEIGHTED,1);
+   double M5_RSI = iRSIMQL5(_Symbol, PERIOD_M5, RsiPeriod, PRICE_WEIGHTED,1);
+   double M1_RSI = iRSIMQL5(_Symbol, PERIOD_M1, RsiPeriod, PRICE_WEIGHTED,1);
+
+   double W1_ADX = iADX(_Symbol, PERIOD_W1, 14);
+   double D1_ADX = iADX(_Symbol, PERIOD_D1, 14);
+   double H4_ADX = iADX(_Symbol, PERIOD_H4, 14);
+   double H1_ADX = iADX(_Symbol, PERIOD_H1, 14);
+   double M30_ADX = iADX(_Symbol, PERIOD_M30, 14);
+   double M15_ADX = iADX(_Symbol, PERIOD_M15, 14);
+
+   double W1_BB_upper = iBands(NULL, PERIOD_W1, BB_Period, BB_Deviation, 0, MODE_UPPER);
+   double W1_BB_lower = iBands(NULL, PERIOD_W1, BB_Period, BB_Deviation, 0, MODE_LOWER);
+   double D1_BB_upper = iBands(NULL, PERIOD_D1, BB_Period, BB_Deviation, 0, MODE_UPPER);
+   double D1_BB_lower = iBands(NULL, PERIOD_D1, BB_Period, BB_Deviation, 0, MODE_LOWER);
+   double H4_BB_upper = iBands(NULL, PERIOD_H4, BB_Period, BB_Deviation, 0, MODE_UPPER);
+   double H4_BB_lower = iBands(NULL, PERIOD_H4, BB_Period, BB_Deviation, 0, MODE_LOWER);
+   double H1_BB_upper = iBands(NULL, PERIOD_H1, BB_Period, BB_Deviation, 0, MODE_UPPER);
+   double H1_BB_lower = iBands(NULL, PERIOD_H1, BB_Period, BB_Deviation, 0, MODE_LOWER);
+   double M30_BB_upper = iBands(NULL, PERIOD_M30, BB_Period, BB_Deviation, 0, MODE_UPPER);
+   double M30_BB_lower = iBands(NULL, PERIOD_M30, BB_Period, BB_Deviation, 0, MODE_LOWER);
+   double M15_BB_upper = iBands(NULL, PERIOD_M15, BB_Period, BB_Deviation, 0, MODE_UPPER);
+   double M15_BB_lower = iBands(NULL, PERIOD_M15, BB_Period, BB_Deviation, 0, MODE_LOWER);
+
+
+// Calculate Stochastic Oscillator
+   int Stoch_Period_K = 14;
+   int Stoch_Period_D = 3;
+   int Stoch_Slowing = 3;
+   ENUM_MA_METHOD Stoch_MA = MODE_SMA;
+
+// Access the Stoch values using the iStochMQL5 function
+   double W1_Stoch_K_Value = iStochMQL5(NULL, PERIOD_W1, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 0, 0);
+   double W1_Stoch_D_Value = iStochMQL5(NULL, PERIOD_W1, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 1, 0);
+   double D1_Stoch_K_Value = iStochMQL5(NULL, PERIOD_D1, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 0, 0);
+   double D1_Stoch_D_Value = iStochMQL5(NULL, PERIOD_D1, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 1, 0);
+   double H12_Stoch_K_Value = iStochMQL5(NULL, PERIOD_H12, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 0, 0);
+   double H12_Stoch_D_Value = iStochMQL5(NULL, PERIOD_H12, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 1, 0);
+   double H4_Stoch_K_Value = iStochMQL5(NULL, PERIOD_H4, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 0, 0);
+   double H4_Stoch_D_Value = iStochMQL5(NULL, PERIOD_H4, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 1, 0);
+   double H1_Stoch_K_Value = iStochMQL5(NULL, PERIOD_H1, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 0, 0);
+   double H1_Stoch_D_Value = iStochMQL5(NULL, PERIOD_H1, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 1, 0);
+   double M30_Stoch_K_Value = iStochMQL5(NULL, PERIOD_M30, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 0, 0);
+   double M30_Stoch_D_Value = iStochMQL5(NULL, PERIOD_M30, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 1, 0);
+   double M15_Stoch_K_Value = iStochMQL5(NULL, PERIOD_M15, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 0, 0);
+   double M15_Stoch_D_Value = iStochMQL5(NULL, PERIOD_M15, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 1, 0);
+   double M5_Stoch_K_Value = iStochMQL5(NULL, PERIOD_M5, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 0, 0);
+   double M5_Stoch_D_Value = iStochMQL5(NULL, PERIOD_M5, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 1, 0);
+   double M1_Stoch_K_Value = iStochMQL5(NULL, PERIOD_M1, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 0, 0);
+   double M1_Stoch_D_Value = iStochMQL5(NULL, PERIOD_M1, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 1, 0);
+
+// print the Stoch values to see if they are correct
+//Print("W1 Stoch K:", W1_Stoch_K_Value, "W1 Stoch D:", W1_Stoch_D_Value);
+//   Print("D1 Stoch K:", D1_Stoch_K_Value, "D1 Stoch D:", D1_Stoch_D_Value);
+
+
+//MACD
+   double H4_MACD = iMACDMQL5(_Symbol, PERIOD_H4, 12, 26, 9, 1, 0, 0);
+   double H1_MACD = iMACDMQL5(_Symbol, PERIOD_H1, 12, 26, 9, 1, 0, 0);
+   double M30_MACD = iMACDMQL5(_Symbol, PERIOD_M30, 12, 26, 9, 1, 0, 0);
+   double M15_MACD = iMACDMQL5(_Symbol, PERIOD_M15, 12, 26, 9, 1, 0, 0);
+
+   double M15_MACD_Main = iMACDMQL5(_Symbol, PERIOD_M15, 12, 26, 9, PRICE_CLOSE, 0, 1);
+   double M15_MACD_Signal = iMACDMQL5(_Symbol, PERIOD_M15, 12, 26, 9, PRICE_CLOSE, 1, 1);
+   double M15_MACD_Main_Previous = iMACDMQL5(_Symbol, PERIOD_M15, 12, 26, 9, PRICE_CLOSE, 0, 2);
+   double M15_MACD_Signal_Previous = iMACDMQL5(_Symbol, PERIOD_M15, 12, 26, 9, PRICE_CLOSE, 1, 2);
+
+// AC
+   double M15_AC = iACMQL5(_Symbol, PERIOD_M15, 0);
+   double M5_AC = iACMQL5(_Symbol, PERIOD_M5, 0);
+   double M1_AC = iACMQL5(_Symbol, PERIOD_M1, 0);
+
+// AO
+   double M15_AO = iAOMQL5(_Symbol, PERIOD_M15, 0);
+   double M5_AO = iAOMQL5(_Symbol, PERIOD_M5, 0);
+   double M1_AO = iAOMQL5(_Symbol, PERIOD_M1, 0);
+
+//ATR
+   double W1_ATR = iATRMQL5(_Symbol, PERIOD_W1, 14, 1);
+   double D1_ATR = iATRMQL5(_Symbol, PERIOD_D1, 14, 1);
+   double H4_ATR = iATRMQL5(_Symbol, PERIOD_H4, 14, 1);
+   double H1_ATR = iATRMQL5(_Symbol, PERIOD_H1, 14, 1);
+   double M15_ATR = iATRMQL5(_Symbol, PERIOD_M15, 14, 1);
+   double M5_ATR = iATRMQL5(_Symbol, PERIOD_M5, 14, 1);
+   double M1_ATR = iATRMQL5(_Symbol, PERIOD_M1, 14, 1);
+
+// CCI values
+   double W1_CCI = iCCIMQL5(_Symbol, PERIOD_W1, 14, 1);
+   double D1_CCI = iCCIMQL5(_Symbol, PERIOD_D1, 14, 1);
+   double H4_CCI = iCCIMQL5(_Symbol, PERIOD_H4, 14, 1);
+   double H1_CCI = iCCIMQL5(_Symbol, PERIOD_H1, 14, 1);
+   double M30_CCI = iCCIMQL5(_Symbol, PERIOD_M30, 14, 1);
+   double M15_CCI = iCCIMQL5(_Symbol, PERIOD_M15, 14, 1);
+   double M5_CCI = iCCIMQL5(_Symbol, PERIOD_M5, 14, 1);
+   double M1_CCI = iCCIMQL5(_Symbol, PERIOD_M1, 14, 1);
+
+
+   if(D1_RSI==EMPTY_VALUE)  // no data yet
+      return;
+
+// Get DONCHIAN BANDS
+   double HighestHigh = iHighest(NULL, PERIOD_M5, MODE_HIGH, 20, 1);
+   double LowestLow = iLowest(NULL, PERIOD_M5, MODE_LOW, 20, 1);
+
+// Define the AdaptiveEMA parameters
+   string symbol = _Symbol;
+   ENUM_TIMEFRAMES timeframe = PERIOD_D1;
+   int periodFast = 50;
+   int periodSlow = 200;
+   int ma_shift = 0;
+   ENUM_MA_METHOD ma_method = MODE_EMA;
+   ENUM_APPLIED_PRICE applied_price = PRICE_CLOSE;
+   int shift = 1;
+   double alphaMin = 0.1;
+   double alphaMax = 0.9;
+   double weight = 1.0;
+
+// Calculate the AdaptiveEMAs
+//double H1FastAdaptiveEMA = AdaptiveEMA(symbol, timeframe, periodFast, ma_shift, ma_method, applied_price, shift, alphaMin, alphaMax, weight);
+//double H1SlowAdaptiveEMA = AdaptiveEMA(symbol, timeframe, periodSlow, ma_shift, ma_method, applied_price, shift, alphaMin, alphaMax, weight);
+
+   double mfi = GetMoneyFlowIndex(MFI_Period, PERIOD_D1);
+
+// Get Support & Resistance Points
+   double SR = GetSuppResPoints();
+   double support = GetSuppResPoints() - SR;
+   double resistance = GetSuppResPoints() + SR;
+
+// Get the Heikin-Ashi Close
+   double haClose[5];
+   GetHeikinAshiCloses(haClose);
+
+   Execution_Mode = (ENUM_SYMBOL_TRADE_EXECUTION)SymbolInfoInteger(Symbol(), SYMBOL_TRADE_EXEMODE);
+
+   if(Execution_Mode != SYMBOL_TRADE_EXECUTION_INSTANT)
+      DoSLTP();
+
+//strategy session 1
+//   if(DRClose[0] > DR_high && M5slowMA_short_term < M5fastMA_short_term && trendM15 == 1 && trendM5 == 1 && trendM1 == 1 && M5_ATR > AtrThreshold)
+//     {
+//      fBuy();
+//     }
+
+//   if(DRClose[0] < DR_low && M5slowMA_short_term > M5fastMA_short_term && trendM15 == -1 && trendM5 == -1 && trendM1 == -1 && M5_ATR > AtrThreshold)
+//     {
+//      fSell();
+//     }
+
+
+
+// Neural declare the inputs variable
+//   double inputs[INPUT_LAYER_NEURONS];
+//   double learning_rate = Neural_learning_rate;
+
+// Check for Buy and Sell signals
+//   if(M5slowMA_short_term < M5fastMA_short_term && M1slowMA_short_term < M1fastMA_short_term && trendM15 == 1 && trendM5 == 1 && trendM1 == 1 && M15_AO > 0 && M5_AO > 0 && M1_AO > 0 && M15_AC > 0 && M5_AC > 0 && M1_AC > 0)
+//     {
+//      inputs[0] = M5slowMA_short_term < M5fastMA_short_term && M1slowMA_short_term < M1fastMA_short_term;
+//      inputs[1] = trendM15 == 1 && trendM5 == 1 && trendM1 == 1;
+//      inputs[2] = M15_AO > 0 && M5_AO > 0 && M1_AO > 0 && M15_AC > 0 && M5_AC > 0 && M1_AC > 0;
+
+// Predict buy and sell signals
+//      predict(inputs, predicted_buy, predicted_sell);
+
+// Place buy order if predicted buy signal is true
+//      if(predicted_buy)
+//        {
+//         fBuy();
+//        }
+//     }
+
+//   if(M5slowMA_short_term > M5fastMA_short_term && M1slowMA_short_term > M1fastMA_short_term && trendM15 == -1 && trendM5 == -1 && trendM1 == -1 && M15_AO < 0 && M5_AO < 0 && M1_AO < 0 && M15_AC < 0 && M5_AC < 0 && M1_AC < 0)
+//     {
+//      inputs[0] = M5slowMA_short_term > M5fastMA_short_term && M1slowMA_short_term > M1fastMA_short_term;
+//      inputs[1] = trendM15 == -1 && trendM5 == -1 && trendM1 == -1;
+//      inputs[2] = M15_AO < 0 && M5_AO < 0 && M1_AO < 0 && M15_AC < 0 && M5_AC < 0 && M1_AC < 0;
+
+// Predict buy and sell signals
+//      predict(inputs, predicted_buy, predicted_sell);
+
+// Place sell order if predicted sell signal is true
+//      if(predicted_sell)
+//        {
+//         fSell();
+//        }
+//     }
+
+// Evaluate the trade
+//   TradeInfo tradeInfo = evaluateTrade(predicted_buy, predicted_sell, entryPrice, exitPrice);
+
+// Evaluate trade profitability and update network based on feedback
+//   update_network(inputs, predicted_buy, predicted_sell, learning_rate, tradeInfo.profitable);
+
+  }
+datetime tradesessionend = 0;
+int GetSession()
+  {
+   datetime startdt1 = TimeToDt(int(RegularDRSessionEnd/100),RegularDRSessionEnd %100,0);
+
+   datetime enddt1 = TimeToDt(int(RegularDRTradeEnd/100),RegularDRTradeEnd%100,0);
+   if(enddt1<startdt1)
+      enddt1+=3600*24;
+
+
+   datetime startdt2 = TimeToDt(int(EveningDRSessionEnd/100),EveningDRSessionEnd %100,0);
+
+   datetime enddt2 = TimeToDt(int(EveningDRTradeEnd/100),EveningDRTradeEnd%100,0);
+   if(enddt2<startdt2)
+      enddt2+=3600*24;
+
+
+   datetime startdt3 = TimeToDt(int(OvernightDRSessionEnd/100),OvernightDRSessionEnd %100,0);
+
+   datetime enddt3 = TimeToDt(int(OvernightDRTradeEnd/100),OvernightDRTradeEnd%100,0);
+   if(enddt3<startdt3)
+      enddt3+=3600*24;
+
+
+
+
+   if(TimeCurrent()>=startdt1 && TimeCurrent()<enddt1)
+     {
+      tradesessionend = enddt1;
+      return 0;
+     }
+
+   if(TimeCurrent()>=startdt2 && TimeCurrent()<enddt2)
+     {
+      tradesessionend = enddt2;
+      return 1;
+     }
+
+   if(TimeCurrent()>=startdt3 && TimeCurrent()<enddt3)
+     {
+      tradesessionend = enddt3;
+      return 2;
+     }
+
+   return -1;
+
+  }
+datetime closecheck;
+bool GetDR(int sessionstart,int sessionend)
+  {
+// Calculate the high and low of the 5-minute timeframe during the session
+   datetime startdt = TimeToDt(int(sessionstart/100),sessionstart%100,0);
+   int nextday = 0;
+
+
+   datetime enddt = TimeToDt(int(sessionend/100),sessionend%100,0);
+   if(enddt<startdt)
+      enddt+=3600*24;
+
+   double high = 0;
+   double low = DBL_MAX;
+   int start= iBarShift(Symbol(),PERIOD_M5,startdt);
+   int end= iBarShift(Symbol(),PERIOD_M5,enddt);
+   for(int i = end+1; i <= start; i ++)
+     {
+      if(iHigh(Symbol(), PERIOD_M5, i) > high)
+        {
+         high = iHigh(Symbol(), PERIOD_M5, i);
+         //  Print(high);
+        }
+      if(iLow(Symbol(), PERIOD_M5, i) < low)
+        {
+         low = iLow(Symbol(), PERIOD_M5, i);
+        }
+     }
+   DR_high = high;
+   DR_low = low;
+   closecheck = enddt;
+
+   if(ShowBoxes)
+     {
+      // Print("rect ",startdt," ",DR_low," ",enddt," ",DR_high," ",start," ", end);
+      RectangleCreate(0,"calcbox"+closecheck,0,startdt,DR_low,enddt,DR_high,clrRed,STYLE_SOLID,1);
+
+     }
+
+   /*  if (TimeCurrent()<tradeend)
+       return false;
+
+     if (startdt>enddt && TimeCurrent()<enddt)
+       return false;*/
+   return true;
+  }
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+class idrclass
+  {
+public:
+   double            high;
+   double            low;
+
+   void              ini()
+     {
+      low = MathMin(iClose(NULL,PERIOD_CURRENT,0),iOpen(NULL,PERIOD_CURRENT,0));
+      high = MathMax(iClose(NULL,PERIOD_CURRENT,0),iOpen(NULL,PERIOD_CURRENT,0));
+     }
+
+   void              update()
+     {
+      high = MathMax(iOpen(NULL,PERIOD_CURRENT,0), MathMax(iClose(NULL,PERIOD_CURRENT,0), high));
+      low = MathMin(iOpen(NULL,PERIOD_CURRENT,0), MathMin(iClose(NULL,PERIOD_CURRENT,0), low));
+
+     }
+
+   void              GetNewYork()
+     {
+      datetime startdt = TimeToDt(16,30,0);
+      datetime enddt = TimeToDt(17,30,0);
+      if(TimeCurrent()<startdt)
+        {
+         ini();
+        }
+      else
+         if(TimeCurrent()<enddt && TimeCurrent()>=startdt)
+           {
+
+            update();
+           }
+
+     }
+
+
+  };
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+idrclass idr;
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+void OpenPositions(double Fibo100, double Fibo23, double Fibo38, double Fibo61, double Fibo76, double Fibo00, double FiboBASE)
+  {
+   FiboCreate(Fibo100, Fibo23, Fibo38, Fibo61, Fibo76, Fibo00, FiboBASE);
+   int trendM1 = GetTrend(_Symbol, PERIOD_M1);
+   int trendM2 = GetTrend(_Symbol, PERIOD_M2);
+   int trendM3 = GetTrend(_Symbol, PERIOD_M3);
+   int trendM4 = GetTrend(_Symbol, PERIOD_M4);
+   int trendM5 = GetTrend(_Symbol, PERIOD_M5);
+   int trendM6 = GetTrend(_Symbol, PERIOD_M6);
+   int trendM12 = GetTrend(_Symbol, PERIOD_M12);
+   int trendM15 = GetTrend(_Symbol, PERIOD_M15);
+   int trendM30 = GetTrend(_Symbol, PERIOD_M30);
+   int trendH1 = GetTrend(_Symbol, PERIOD_H1);
+   int trendH4 = GetTrend(_Symbol, PERIOD_H4);
+   int trendD1 = GetTrend(_Symbol, PERIOD_D1);
+
+   double D1fastMA = iMAMQL5(NULL, PERIOD_D1, 50, 0, MODE_EMA, PRICE_CLOSE,1);
+   double D1slowMA = iMAMQL5(NULL, PERIOD_D1, 200, 0, MODE_EMA, PRICE_CLOSE,1);
+   double H12fastMA = iMAMQL5(NULL, PERIOD_H12, 50, 0, MODE_EMA, PRICE_CLOSE,1);
+   double H12slowMA = iMAMQL5(NULL, PERIOD_H12, 200, 0, MODE_EMA, PRICE_CLOSE,1);
+   double H8fastMA = iMAMQL5(NULL, PERIOD_H8, 50, 0, MODE_EMA, PRICE_CLOSE,1);
+   double H8slowMA = iMAMQL5(NULL, PERIOD_H8, 200, 0, MODE_EMA, PRICE_CLOSE,1);
+   double H6fastMA = iMAMQL5(NULL, PERIOD_H6, 50, 0, MODE_EMA, PRICE_CLOSE,1);
+   double H6slowMA = iMAMQL5(NULL, PERIOD_H6, 200, 0, MODE_EMA, PRICE_CLOSE,1);
+   double H4fastMA = iMAMQL5(NULL, PERIOD_H4, 50, 0, MODE_EMA, PRICE_CLOSE,1);
+   double H4slowMA = iMAMQL5(NULL, PERIOD_H4, 200, 0, MODE_EMA, PRICE_CLOSE,1);
+   double H1fastMA = iMAMQL5(NULL, PERIOD_H1, 50, 0, MODE_EMA, PRICE_CLOSE,1);
+   double H1slowMA = iMAMQL5(NULL, PERIOD_H1, 200, 0, MODE_EMA, PRICE_CLOSE,1);
+
+   double M30fastMA = iMAMQL5(NULL, PERIOD_M30, 50, 0, MODE_EMA, PRICE_CLOSE,1);
+   double M30slowMA = iMAMQL5(NULL, PERIOD_M30, 200, 0, MODE_EMA, PRICE_CLOSE,1);
+   double M15fastMA = iMAMQL5(NULL, PERIOD_M15, 50, 0, MODE_EMA, PRICE_CLOSE,1);
+   double M15slowMA = iMAMQL5(NULL, PERIOD_M15, 200, 0, MODE_EMA, PRICE_CLOSE,1);
+
+   double M5fastMA = iMAMQL5(NULL, PERIOD_M5, 50, 0, MODE_EMA, PRICE_CLOSE,1);
+   double M5slowMA = iMAMQL5(NULL, PERIOD_M5, 200, 0, MODE_EMA, PRICE_CLOSE,1);
+   double M1fastMA = iMAMQL5(NULL, PERIOD_M1, 50, 0, MODE_EMA, PRICE_CLOSE,1);
+   double M1slowMA = iMAMQL5(NULL, PERIOD_M1, 200, 0, MODE_EMA, PRICE_CLOSE,1);
+
+
+// AC
+   double D1_AC = iACMQL5(_Symbol, PERIOD_D1, 0);
+   double M15_AC = iACMQL5(_Symbol, PERIOD_M15, 0);
+   double M5_AC = iACMQL5(_Symbol, PERIOD_M5, 0);
+   double M4_AC = iACMQL5(_Symbol, PERIOD_M4, 0);
+   double M3_AC = iACMQL5(_Symbol, PERIOD_M3, 0);
+   double M2_AC = iACMQL5(_Symbol, PERIOD_M2, 0);
+   double M1_AC = iACMQL5(_Symbol, PERIOD_M1, 0);
+
+// AO
+   double D1_AO = iAOMQL5(_Symbol, PERIOD_D1, 0);
+   double M15_AO = iAOMQL5(_Symbol, PERIOD_M15, 0);
+   double M5_AO = iAOMQL5(_Symbol, PERIOD_M5, 0);
+   double M4_AO = iAOMQL5(_Symbol, PERIOD_M4, 0);
+   double M3_AO = iAOMQL5(_Symbol, PERIOD_M3, 0);
+   double M2_AO = iAOMQL5(_Symbol, PERIOD_M2, 0);
+   double M1_AO = iAOMQL5(_Symbol, PERIOD_M1, 0);
+
+
+   double M1_RSI = iRSIMQL5(NULL, PERIOD_M1, 14, PRICE_CLOSE, 1);
+   double M5_RSI = iRSIMQL5(NULL, PERIOD_M5, 14, PRICE_CLOSE, 1);
+   double M15_RSI = iRSIMQL5(NULL, PERIOD_M15, 14, PRICE_CLOSE, 1);
+   double M30_RSI = iRSIMQL5(NULL, PERIOD_M30, 14, PRICE_CLOSE, 1);
+   double H1_RSI = iRSIMQL5(NULL, PERIOD_H1, 14, PRICE_CLOSE, 1);
+   double H4_RSI = iRSIMQL5(NULL, PERIOD_H4, 14, PRICE_CLOSE, 1);
+   double D1_RSI = iRSIMQL5(NULL, PERIOD_D1, 14, PRICE_CLOSE, 1);
+
+//MACD
+   double D1_MACD = iMACDMQL5(_Symbol, PERIOD_D1, 12, 26, 9, 1, 0, 0);
+   double H12_MACD = iMACDMQL5(_Symbol, PERIOD_H12, 12, 26, 9, 1, 0, 0);
+   double H8_MACD = iMACDMQL5(_Symbol, PERIOD_H8, 12, 26, 9, 1, 0, 0);
+   double H6_MACD = iMACDMQL5(_Symbol, PERIOD_H6, 12, 26, 9, 1, 0, 0);
+   double H4_MACD = iMACDMQL5(_Symbol, PERIOD_H4, 12, 26, 9, 1, 0, 0);
+   double H1_MACD = iMACDMQL5(_Symbol, PERIOD_H1, 12, 26, 9, 1, 0, 0);
+   double M30_MACD = iMACDMQL5(_Symbol, PERIOD_M30, 12, 26, 9, 1, 0, 0);
+   double M15_MACD = iMACDMQL5(_Symbol, PERIOD_M15, 12, 26, 9, 1, 0, 0);
+
+   CopyNumber = CopyBuffer(ZZ_Handle, 0, 0, 50, ZZ_Buffer);
+   if(CopyNumber <= 0)
+     {
+      Print("Indicator buffer is unavailable");
+      return;
+     }
+   ArraySetAsSeries(ZZ_Buffer, true);
+
+   if(CopyRates(Symbol(), 0, 0, 50, RatesArray) > 0)
+     {
+      ArraySetAsSeries(RatesArray, true);
+
+      int ZCount = 0;
+      for(int i = 0; i < 50 && ZCount < 50 && !IsStopped(); i++)
+        {
+         if(ZZ_Buffer[i] != 0)
+           {
+            HL[ZCount] = ZZ_Buffer[i];
+            HL_Time[ZCount] = RatesArray[i].time;
+            ZCount++;
+           }
+        }
+      TrendDirection = CheckTrend();
+      double lastHigh = HL[0];
+      double lastLow = HL[1];
+      datetime lastHighTime = HL_Time[0];
+      datetime lastLowTime = HL_Time[1];
+      if(lastHigh != 0 && lastLow != 0)
+        {
+         Fibo100 = lastHigh;
+         Fibo23 = lastHigh - 0.236 * (lastHigh - lastLow);
+         Fibo38 = lastHigh - 0.382 * (lastHigh - lastLow);
+         Fibo61 = lastHigh - 0.618 * (lastHigh - lastLow);
+         Fibo76 = lastHigh - 0.764 * (lastHigh - lastLow);
+         Fibo00 = lastLow;
+         FiboBASE = lastHigh - lastLow;
+        }
+
+
+      if(ZZ_Buffer[0] != 0 && ZZ_Buffer[0] != HL[0])
+        {
+         double currentHigh = HL[0];
+         double currentLow = HL[1];
+
+         if(ZZ_Buffer[0] > currentHigh)
+           {
+            currentHigh = ZZ_Buffer[0];
+            HL[2] = currentLow;
+            HL[1] = currentHigh;
+           }
+         else
+            if(ZZ_Buffer[0] < currentLow)
+              {
+               currentLow = ZZ_Buffer[0];
+               HL[2] = currentHigh;
+               HL[1] = currentLow;
+              }
+
+         HL[0] = currentHigh;
+         HL_Time[2] = HL_Time[1];
+         HL_Time[1] = HL_Time[0];
+         HL_Time[0] = RatesArray[0].time;
+
+         TrendDirection = CheckTrend();
+         FiboCreate(Fibo100, Fibo23, Fibo38, Fibo61, Fibo76, Fibo00, FiboBASE);
+        }
+
+
+      if(!PositionSelect(Symbol()))
+        {
+         switch(TrendDirection)
+           {
+            case 1:
+               Comment("Trend is Up");
+               if(trendD1 == 1 && D1_MACD > 0)
+                 {
+                  Print("Buy condition is TRUE");
+                  fBuy();
+                 }
+               break;
+            case -1:
+               Comment("Trend is Down");
+               if(trendD1 == -1 && D1_MACD < 0)
+                 {
+                  Print("Sell condition is TRUE");
+                  fSell();
+                 }
+               break;
+            case 0:
+               Comment("FLAT");
+               break;
+           }
+        }
+     }
+   else
+     {
+      Print("Time series is not available ", GetLastError());
+     }
+  }
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+#define MODE_MAIN 0
+#define MODE_SIGNAL 1
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+int CheckTrend()
+  {
+
+// Previous trend checks
+   int trendM1 = GetTrend(_Symbol, PERIOD_M1);
+   int trendM2 = GetTrend(_Symbol, PERIOD_M2);
+   int trendM3 = GetTrend(_Symbol, PERIOD_M3);
+   int trendM4 = GetTrend(_Symbol, PERIOD_M4);
+   int trendM5 = GetTrend(_Symbol, PERIOD_M5);
+   int trendM6 = GetTrend(_Symbol, PERIOD_M6);
+   int trendM15 = GetTrend(_Symbol, PERIOD_M15);
+   int trendM30 = GetTrend(_Symbol, PERIOD_M30);
+   int trendH1 = GetTrend(_Symbol, PERIOD_H1);
+   int trendH2 = GetTrend(_Symbol, PERIOD_H2);
+   int trendH3 = GetTrend(_Symbol, PERIOD_H3);
+   int trendH4 = GetTrend(_Symbol, PERIOD_H4);
+   int trendD1 = GetTrend(_Symbol, PERIOD_D1);
+
+   double D1fastMA = iMAMQL5(NULL, PERIOD_D1, 50, 0, MODE_EMA, PRICE_CLOSE,1);
+   double D1slowMA = iMAMQL5(NULL, PERIOD_D1, 200, 0, MODE_EMA, PRICE_CLOSE,1);
+
+   double H12fastMA = iMAMQL5(NULL, PERIOD_H12, 50, 0, MODE_EMA, PRICE_CLOSE,1);
+   double H12slowMA = iMAMQL5(NULL, PERIOD_H12, 200, 0, MODE_EMA, PRICE_CLOSE,1);
+
+   double H8fastMA = iMAMQL5(NULL, PERIOD_H8, 50, 0, MODE_EMA, PRICE_CLOSE,1);
+   double H8slowMA = iMAMQL5(NULL, PERIOD_H8, 200, 0, MODE_EMA, PRICE_CLOSE,1);
+
+
+   double H6fastMA = iMAMQL5(NULL, PERIOD_H6, 50, 0, MODE_EMA, PRICE_CLOSE,1);
+   double H6slowMA = iMAMQL5(NULL, PERIOD_H6, 200, 0, MODE_EMA, PRICE_CLOSE,1);
+
+   double H4fastMA = iMAMQL5(NULL, PERIOD_H4, 50, 0, MODE_EMA, PRICE_CLOSE,1);
+   double H4slowMA = iMAMQL5(NULL, PERIOD_H4, 200, 0, MODE_EMA, PRICE_CLOSE,1);
+
+   double H1fastMA = iMAMQL5(NULL, PERIOD_H1, 50, 0, MODE_EMA, PRICE_CLOSE,1);
+   double H1slowMA = iMAMQL5(NULL, PERIOD_H1, 200, 0, MODE_EMA, PRICE_CLOSE,1);
+
+   double M30fastMA = iMAMQL5(NULL, PERIOD_M30, 50, 0, MODE_EMA, PRICE_CLOSE,1);
+   double M30slowMA = iMAMQL5(NULL, PERIOD_M30, 200, 0, MODE_EMA, PRICE_CLOSE,1);
+
+   double M15fastMA = iMAMQL5(NULL, PERIOD_M15, 50, 0, MODE_EMA, PRICE_CLOSE,1);
+   double M15slowMA = iMAMQL5(NULL, PERIOD_M15, 200, 0, MODE_EMA, PRICE_CLOSE,1);
+
+   double M5fastMA = iMAMQL5(NULL, PERIOD_M5, 50, 0, MODE_EMA, PRICE_CLOSE,1);
+   double M5slowMA = iMAMQL5(NULL, PERIOD_M5, 200, 0, MODE_EMA, PRICE_CLOSE,1);
+
+   double M1fastMA = iMAMQL5(NULL, PERIOD_M1, 50, 0, MODE_EMA, PRICE_CLOSE,1);
+   double M1slowMA = iMAMQL5(NULL, PERIOD_M1, 200, 0, MODE_EMA, PRICE_CLOSE,1);
+
+// AC
+   double M15_AC = iACMQL5(_Symbol, PERIOD_M15, 0);
+   double M5_AC = iACMQL5(_Symbol, PERIOD_M5, 0);
+   double M4_AC = iACMQL5(_Symbol, PERIOD_M4, 0);
+   double M3_AC = iACMQL5(_Symbol, PERIOD_M3, 0);
+   double M2_AC = iACMQL5(_Symbol, PERIOD_M2, 0);
+   double M1_AC = iACMQL5(_Symbol, PERIOD_M1, 0);
+
+// AO
+   double M15_AO = iAOMQL5(_Symbol, PERIOD_M15, 0);
+   double M5_AO = iAOMQL5(_Symbol, PERIOD_M5, 0);
+   double M4_AO = iAOMQL5(_Symbol, PERIOD_M4, 0);
+   double M3_AO = iAOMQL5(_Symbol, PERIOD_M3, 0);
+   double M2_AO = iAOMQL5(_Symbol, PERIOD_M2, 0);
+   double M1_AO = iAOMQL5(_Symbol, PERIOD_M1, 0);
+
+//MACD
+   double D1_MACD = iMACDMQL5(_Symbol, PERIOD_D1, 12, 26, 9, 1, 0, 0);
+   double H12_MACD = iMACDMQL5(_Symbol, PERIOD_H12, 12, 26, 9, 1, 0, 0);
+   double H8_MACD = iMACDMQL5(_Symbol, PERIOD_H8, 12, 26, 9, 1, 0, 0);
+   double H6_MACD = iMACDMQL5(_Symbol, PERIOD_H6, 12, 26, 9, 1, 0, 0);
+   double H4_MACD = iMACDMQL5(_Symbol, PERIOD_H4, 12, 26, 9, 1, 0, 0);
+   double H3_MACD = iMACDMQL5(_Symbol, PERIOD_H3, 12, 26, 9, 1, 0, 0);
+   double H2_MACD = iMACDMQL5(_Symbol, PERIOD_H2, 12, 26, 9, 1, 0, 0);
+   double H1_MACD = iMACDMQL5(_Symbol, PERIOD_H1, 12, 26, 9, 1, 0, 0);
+   double M30_MACD = iMACDMQL5(_Symbol, PERIOD_M30, 12, 26, 9, 1, 0, 0);
+   double M20_MACD = iMACDMQL5(_Symbol, PERIOD_M20, 12, 26, 9, 1, 0, 0);
+   double M15_MACD = iMACDMQL5(_Symbol, PERIOD_M15, 12, 26, 9, 1, 0, 0);
+   double M12_MACD = iMACDMQL5(_Symbol, PERIOD_M12, 12, 26, 9, 1, 0, 0);
+   double M10_MACD = iMACDMQL5(_Symbol, PERIOD_M10, 12, 26, 9, 1, 0, 0);
+   double M6_MACD = iMACDMQL5(_Symbol, PERIOD_M6, 12, 26, 9, 1, 0, 0);
+   double M5_MACD = iMACDMQL5(_Symbol, PERIOD_M5, 12, 26, 9, 1, 0, 0);
+   double M4_MACD = iMACDMQL5(_Symbol, PERIOD_M4, 12, 26, 9, 1, 0, 0);
+   double M3_MACD = iMACDMQL5(_Symbol, PERIOD_M3, 12, 26, 9, 1, 0, 0);
+   double M2_MACD = iMACDMQL5(_Symbol, PERIOD_M2, 12, 26, 9, 1, 0, 0);
+   double M1_MACD = iMACDMQL5(_Symbol, PERIOD_M1, 12, 26, 9, 1, 0, 0);
+
+// Calculate Stochastic Oscillator
+   int Stoch_Period_K = 14;
+   int Stoch_Period_D = 3;
+   int Stoch_Slowing = 3;
+   ENUM_MA_METHOD Stoch_MA = MODE_SMA;
+
+// Access the Stoch values using the iStochMQL5 function
+   double W1_Stoch_K_Value = iStochMQL5(NULL, PERIOD_W1, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 0, 0);
+   double W1_Stoch_D_Value = iStochMQL5(NULL, PERIOD_W1, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 1, 0);
+   double D1_Stoch_K_Value = iStochMQL5(NULL, PERIOD_D1, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 0, 0);
+   double D1_Stoch_D_Value = iStochMQL5(NULL, PERIOD_D1, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 1, 0);
+   double H12_Stoch_K_Value = iStochMQL5(NULL, PERIOD_H12, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 0, 0);
+   double H12_Stoch_D_Value = iStochMQL5(NULL, PERIOD_H12, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 1, 0);
+   double H4_Stoch_K_Value = iStochMQL5(NULL, PERIOD_H4, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 0, 0);
+   double H4_Stoch_D_Value = iStochMQL5(NULL, PERIOD_H4, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 1, 0);
+   double H1_Stoch_K_Value = iStochMQL5(NULL, PERIOD_H1, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 0, 0);
+   double H1_Stoch_D_Value = iStochMQL5(NULL, PERIOD_H1, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 1, 0);
+   double M30_Stoch_K_Value = iStochMQL5(NULL, PERIOD_M30, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 0, 0);
+   double M30_Stoch_D_Value = iStochMQL5(NULL, PERIOD_M30, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 1, 0);
+   double M15_Stoch_K_Value = iStochMQL5(NULL, PERIOD_M15, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 0, 0);
+   double M15_Stoch_D_Value = iStochMQL5(NULL, PERIOD_M15, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 1, 0);
+   double M5_Stoch_K_Value = iStochMQL5(NULL, PERIOD_M5, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 0, 0);
+   double M5_Stoch_D_Value = iStochMQL5(NULL, PERIOD_M5, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 1, 0);
+   double M1_Stoch_K_Value = iStochMQL5(NULL, PERIOD_M1, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 0, 0);
+   double M1_Stoch_D_Value = iStochMQL5(NULL, PERIOD_M1, Stoch_Period_K, Stoch_Period_D, Stoch_Slowing, Stoch_MA, STO_LOWHIGH, 1, 0);
+
+
+   double D1_MACD_main = iMACDMQL5(_Symbol, PERIOD_D1, 12, 26, 9, PRICE_CLOSE, MODE_MAIN, 0);
+   double D1_MACD_signal = iMACDMQL5(_Symbol, PERIOD_D1, 12, 26, 9, PRICE_CLOSE, MODE_SIGNAL, 0);
+
+   double D1_MACD_main_previous = iMACDMQL5(_Symbol, PERIOD_D1, 12, 26, 9, PRICE_CLOSE, MODE_MAIN, 1);
+   double D1_MACD_signal_previous = iMACDMQL5(_Symbol, PERIOD_D1, 12, 26, 9, PRICE_CLOSE, MODE_SIGNAL, 1);
+
+// print the Stoch values to see if they are correct
+//Print("W1 Stoch K:", W1_Stoch_K_Value, "W1 Stoch D:", W1_Stoch_D_Value);
+//   Print("D1 Stoch K:", D1_Stoch_K_Value, "D1 Stoch D:", D1_Stoch_D_Value);
+
+   if(D1slowMA < D1fastMA && trendD1 == 1 && trendH4 == 1 && trendH1 == 1)
+      return 1; // Up trend
+   else
+      if(D1slowMA > D1fastMA && trendD1 == -1 && trendH4 == -1 && trendH1 == -1)
+         return -1; // Down trend
+      else
+         return 0; // No clear trend
+  }
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+bool FiboCreate(double &Fibo100, double &Fibo23, double &Fibo38, double &Fibo61, double &Fibo76, double &Fibo00, double &FiboBASE)
+  {
+   double lastHigh = HL[0];
+   double lastLow = HL[1];
+   datetime lastHighTime = HL_Time[0];
+   datetime lastLowTime = HL_Time[1];
+
+   if(lastHigh != 0 && lastLow != 0)
+     {
+      Fibo100 = lastHigh;
+      Fibo23 = lastHigh - 0.236 * (lastHigh - lastLow);
+      Fibo38 = lastHigh - 0.382 * (lastHigh - lastLow);
+      Fibo61 = lastHigh - 0.618 * (lastHigh - lastLow);
+      Fibo76 = lastHigh - 0.764 * (lastHigh - lastLow);
+      Fibo00 = lastLow;
+      FiboBASE = lastHigh - lastLow;
+
+      if(ObjectCreate(0, "MyFIBO", OBJ_FIBO, 0, lastHighTime, Fibo100, lastLowTime, Fibo00))
+        {
+         ObjectSetInteger(0, "MyFIBO", OBJPROP_LEVELCOLOR, LevelColor);
+         ObjectSetInteger(0, "MyFIBO", OBJPROP_LEVELSTYLE, STYLE_SOLID);
+         ObjectSetInteger(0, "MyFIBO", OBJPROP_RAY_RIGHT, true);
+         ObjectSetInteger(0, "MyFIBO", OBJPROP_LEVELS, 6);
+         ObjectSetDouble(0, "MyFIBO", OBJPROP_LEVELVALUE, 0, 0.0);
+         ObjectSetDouble(0, "MyFIBO", OBJPROP_LEVELVALUE, 1, 0.236);
+         ObjectSetDouble(0, "MyFIBO", OBJPROP_LEVELVALUE, 2, 0.382);
+         ObjectSetDouble(0, "MyFIBO", OBJPROP_LEVELVALUE, 3, 0.618);
+         ObjectSetDouble(0, "MyFIBO", OBJPROP_LEVELVALUE, 4, 0.764);
+         ObjectSetDouble(0, "MyFIBO", OBJPROP_LEVELVALUE, 5, 1.0);
+         ObjectSetString(0, "MyFIBO", OBJPROP_LEVELTEXT, 0, "0.0% (%$)");
+         ObjectSetString(0, "MyFIBO", OBJPROP_LEVELTEXT, 1, "23.6% (%$)");
+         ObjectSetString(0, "MyFIBO", OBJPROP_LEVELTEXT, 2, "38.2% (%$)");
+         ObjectSetString(0, "MyFIBO", OBJPROP_LEVELTEXT, 3, "61.8% (%$)");
+         ObjectSetString(0, "MyFIBO", OBJPROP_LEVELTEXT, 4, "76.4% (%$)");
+         ObjectSetString(0, "MyFIBO", OBJPROP_LEVELTEXT, 5, "100.0% (%$)");
+         //...
+         return true;
+        }
+      else
+        {
+         Print("MyFIBO creation failed");
+         return false;
+        }
+     }
+   else
+     {
+      Print("No ZigZag legs found");
+      return false;
+     }
+  }
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+void ClosePositionSecurity()
+  {
+   double SL = 0, TP = 0;
+   volFactor = GetVolatilityFactor(volPeriod);
+
+   double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double accountEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double drawdown = (accountBalance - accountEquity) / accountBalance * 100.0;
+
+
+   for(int p = 0; p < PositionsTotal(); p++)
+     {
+      if(!PositionSelectByTicket(PositionGetTicket(p)))
+         continue;
+
+      long PosMagic = PositionGetInteger(POSITION_MAGIC);
+      if(PosMagic != Magic)
+         continue;
+
+      double PosOpenPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double PosCurrentPrice = PositionGetDouble(POSITION_PRICE_CURRENT);
+      long PosType = PositionGetInteger(POSITION_TYPE);
+      ulong PosTicket = PositionGetTicket(p);
+      double openPrice = OrderGetDouble(ORDER_PRICE_OPEN);
+      double Bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double Ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double PosStopLoss = PositionGetDouble(POSITION_SL);
+      double PosTakeProfit = PositionGetDouble(POSITION_TP);
+
+      if(drawdown >= MaxDrawUp || drawdown <= MaxDrawDown)
+        {
+         Trade.PositionClose(PosTicket);
+        }
+
+     }
+  }
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+void fBuy()
+  {
+   double lotSize = CalculateLotSize(); // Calculate the lot size
+   double totalRisk = CalculateTotalRisk();
+
+   if(lotSize <= 0)
+     {
+      return; // Return if the calculated lot size is not greater than zero (risk management check)
+     }
+
+   double Bid = SymbolInfoDouble(Symbol(), SYMBOL_BID);
+
+   if(!Trade.PositionOpen(_Symbol, ORDER_TYPE_BUY, lotSize, Bid, 0, 0, Commentary))
+     {
+      int e = GetLastError();
+      Print("OrderSend Error: ", e);
+     }
+
+   DoSLTP(); // Adjust SL, TP, and trailing stop for open positions
+  }
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+void fSell()
+  {
+   double lotSize = CalculateLotSize(); // Calculate the lot size
+   double totalRisk = CalculateTotalRisk();
+
+   if(lotSize <= 0)
+     {
+      return; // Return if the calculated lot size is not greater than zero (risk management check)
+     }
+
+   double Bid = SymbolInfoDouble(Symbol(), SYMBOL_BID);
+
+   if(!Trade.PositionOpen(_Symbol, ORDER_TYPE_SELL, lotSize, Bid, 0, 0, Commentary))
+     {
+      int e = GetLastError();
+      Print("OrderSend Error: ", e);
+     }
+
+   DoSLTP(); // Adjust SL, TP, and trailing stop for open positions
+  }
+
+// Applies SL and TP to open positions
+void DoSLTP()
+  {
+   double SL = 0, TP = 0;
+   volFactor = GetVolatilityFactor(volPeriod);
+
+   for(int i = 0; i < PositionsTotal(); i++)
+     {
+      if(!PositionSelectByTicket(PositionGetTicket(i)))
+         continue;
+      long PosMagic = PositionGetInteger(POSITION_MAGIC);
+
+      //skip Hedge positions with magic number Magic + 1
+      if(PosMagic == Magic + 1)
+         continue;
+
+
+      double PosOpenPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double PosCurrentPrice = PositionGetDouble(POSITION_PRICE_CURRENT);
+      double PosStopLoss = PositionGetDouble(POSITION_SL);
+      double PosTakeProfit = PositionGetDouble(POSITION_TP);
+      long PosType = PositionGetInteger(POSITION_TYPE);
+      ulong PosTicket = PositionGetTicket(i);
+
+
+      if(PosType == POSITION_TYPE_BUY)
+        {
+         // Check if market has moved in favor of trade by TrailingStopPips pips
+         if(PosCurrentPrice > PosOpenPrice + TrailingStopPips * Poin)
+           {
+            // Activate trailing stop
+            SL = NormalizeDouble(PosCurrentPrice - TrailingStopPips * Poin, _Digits);
+            // Update stop loss if necessary
+            if(SL > PosStopLoss)
+               Trade.PositionModify(PosTicket, SL, PosTakeProfit);
+           }
+         else
+           {
+            if(dynamicSL == 1)
+              {
+               // Deactivate trailing stop
+               SL = NormalizeDouble(PosOpenPrice - StopLoss * Poin * volFactor, _Digits);
+               // Update stop loss if necessary
+               if(SL != PosStopLoss)
+                  Trade.PositionModify(PosTicket, SL, PosTakeProfit);
+              }
+            else
+              {
+               // Deactivate trailing stop
+               SL = NormalizeDouble(PosOpenPrice - StopLoss * Poin, _Digits);
+               // Update stop loss if necessary
+               if(SL != PosStopLoss)
+                  Trade.PositionModify(PosTicket, SL, PosTakeProfit);
+              }
+           }
+        }
+      else
+         if(PosType == POSITION_TYPE_SELL)
+           {
+            // Check if market has moved in favor of trade by TrailingStopPips pips
+            if(PosCurrentPrice < PosOpenPrice - TrailingStopPips * Poin)
+              {
+               // Activate trailing stop
+               SL = NormalizeDouble(PosCurrentPrice + TrailingStopPips * Poin, _Digits);
+               // Update stop loss if necessary
+               if(SL < PosStopLoss)
+                  Trade.PositionModify(PosTicket, SL, PosTakeProfit);
+              }
+            else
+              {
+               if(dynamicSL == 1)
+                 {
+                  // Deactivate trailing stop
+                  SL = NormalizeDouble(PosOpenPrice + StopLoss * Poin * volFactor, _Digits);
+                  // Update stop loss if necessary
+                  if(SL != PosStopLoss)
+                     Trade.PositionModify(PosTicket, SL, PosTakeProfit);
+                 }
+               else
+                 {
+                  // Deactivate trailing stop
+                  SL = NormalizeDouble(PosOpenPrice + StopLoss * Poin, _Digits);
+                  // Update stop loss if necessary
+                  if(SL != PosStopLoss)
+                     Trade.PositionModify(PosTicket, SL, PosTakeProfit);
+                 }
+              }
+           }
+
+      if(dynamicSL == 1)
+        {
+         // Update take profit if necessary
+         if(TakeProfit > 0)
+           {
+            if(PosType == POSITION_TYPE_BUY)
+               TP = NormalizeDouble(PosOpenPrice + TakeProfit * Poin * volFactor, _Digits);
+            else
+               if(PosType == POSITION_TYPE_SELL)
+                  TP = NormalizeDouble(PosOpenPrice - TakeProfit * Poin * volFactor, _Digits);
+            if(TP != PosTakeProfit)
+               Trade.PositionModify(PosTicket, PosStopLoss, TP);
+           }
+        }
+      else
+        {
+         // Update take profit if necessary
+         if(TakeProfit > 0)
+           {
+            if(PosType == POSITION_TYPE_BUY)
+               TP = NormalizeDouble(PosOpenPrice + TakeProfit * Poin, _Digits);
+            else
+               if(PosType == POSITION_TYPE_SELL)
+                  TP = NormalizeDouble(PosOpenPrice - TakeProfit * Poin, _Digits);
+            if(TP != PosTakeProfit)
+               Trade.PositionModify(PosTicket, PosStopLoss, TP);
+           }
+        }
+     }
+  }
+
+
+//+------------------------------------------------------------------+
+double GetVolatilityFactor(int period)
+  {
+   int limit = period + 10;
+   double highesthigh = 0;
+   double lowestlow = 0;
+
+// Get highest high and lowest low within the period
+   for(int i = 0; i < limit; i++)
+     {
+      double high = iHigh(_Symbol, PERIOD_CURRENT, i);
+      double low = iLow(_Symbol, PERIOD_CURRENT, i);
+
+      if((i == 0) || (high > highesthigh))
+         highesthigh = high;
+      if((i == 0) || (low < lowestlow))
+         lowestlow = low;
+     }
+
+// Calculate the volatility factor as a percentage of the current price
+   double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double volatility = NormalizeDouble((highesthigh - lowestlow) / price * 100, 2);
+
+// Check for zero volatility and return a default value or raise an error
+   if(volatility == 0)
+     {
+      // return a default value of 1.0
+      return 1.0;
+
+      // alternatively, raise an error
+      // Alert("Error: zero volatility");
+      // return -1;
+     }
+
+   return volatility;
+  }
+
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+bool RectangleCreate(const long            chart_ID=0,        // chart's ID
+                     const string          name="Rectangle",  // rectangle name
+                     const int             sub_window=0,      // subwindow index
+                     datetime              time1=0,           // first point time
+                     double                price1=0,          // first point price
+                     datetime              time2=0,           // second point time
+                     double                price2=0,          // second point price
+                     const color           clr=clrRed,        // rectangle color
+                     const ENUM_LINE_STYLE style=STYLE_SOLID, // style of rectangle lines
+                     const int             width=1,           // width of rectangle lines
+                     const bool            fill=false,        // filling rectangle with color
+                     const bool            back=false,        // in the background
+                     const bool            selection=true,    // highlight to move
+                     const bool            hidden=true,       // hidden in the object list
+                     const long            z_order=0)         // priority for mouse click
+  {
+//--- set anchor points' coordinates if they are not set
+//ChangeRectangleEmptyPoints(time1,price1,time2,price2);
+//--- reset the error value
+   ResetLastError();
+//--- create a rectangle by the given coordinates
+   if(!ObjectCreate(chart_ID,name,OBJ_RECTANGLE,sub_window,time1,price1,time2,price2))
+     {
+      if(ObjectFind(chart_ID,name)<0)
+        {
+         Print(__FUNCTION__,
+               ": failed to create a rectangle! Error code = ",GetLastError());
+         return(false);
+        }
+     }
+//--- set rectangle color
+   ObjectSetInteger(chart_ID,name,OBJPROP_COLOR,clr);
+//--- set the style of rectangle lines
+   ObjectSetInteger(chart_ID,name,OBJPROP_STYLE,style);
+//--- set width of the rectangle lines
+   ObjectSetInteger(chart_ID,name,OBJPROP_WIDTH,width);
+//--- enable (true) or disable (false) the mode of filling the rectangle
+   ObjectSetInteger(chart_ID,name,OBJPROP_FILL,fill);
+//--- display in the foreground (false) or background (true)
+   ObjectSetInteger(chart_ID,name,OBJPROP_BACK,back);
+//--- enable (true) or disable (false) the mode of highlighting the rectangle for moving
+//--- when creating a graphical object using ObjectCreate function, the object cannot be
+//--- highlighted and moved by default. Inside this method, selection parameter
+//--- is true by default making it possible to highlight and move the object
+   ObjectSetInteger(chart_ID,name,OBJPROP_SELECTABLE,selection);
+   ObjectSetInteger(chart_ID,name,OBJPROP_SELECTED,selection);
+//--- hide (true) or display (false) graphical object name in the object list
+   ObjectSetInteger(chart_ID,name,OBJPROP_HIDDEN,hidden);
+//--- set the priority for receiving the event of a mouse click in the chart
+   ObjectSetInteger(chart_ID,name,OBJPROP_ZORDER,z_order);
+//--- successful execution
+   return(true);
+  }
+
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+bool VLineCreate(const long          chart_ID=0,        // chart's ID
+                 const string          name="VLine",      // line name
+                 const int             sub_window=0,      // subwindow index
+                 datetime              time=0,            // line time
+                 const color           clr=clrRed,        // line color
+                 const ENUM_LINE_STYLE style=STYLE_SOLID, // line style
+                 const int             width=1,           // line width
+                 const bool            back=false,        // in the background
+                 const bool            selection=true,    // highlight to move
+                 const bool            hidden=false,       // hidden in the object list
+                 const long            z_order=0)         // priority for mouse click
+  {
+//--- if the line time is not set, draw it via the last bar
+   if(!time)
+      time=TimeCurrent();
+//--- reset the error value
+   ResetLastError();
+//--- create a vertical line
+   if(!ObjectCreate(chart_ID,name,OBJ_VLINE,sub_window,time,0))
+     {
+      if(ObjectFind(chart_ID,name)<0)
+        {
+         Print(__FUNCTION__,
+               ": failed to create a vertical line! Error code = ",GetLastError());
+         return(false);
+        }
+     }
+//--- set line color
+   ObjectSetInteger(chart_ID,name,OBJPROP_COLOR,clr);
+//--- set line display style
+   ObjectSetInteger(chart_ID,name,OBJPROP_STYLE,style);
+//--- set line width
+   ObjectSetInteger(chart_ID,name,OBJPROP_WIDTH,width);
+//--- display in the foreground (false) or background (true)
+   ObjectSetInteger(chart_ID,name,OBJPROP_BACK,back);
+//--- enable (true) or disable (false) the mode of moving the line by mouse
+//--- when creating a graphical object using ObjectCreate function, the object cannot be
+//--- highlighted and moved by default. Inside this method, selection parameter
+//--- is true by default making it possible to highlight and move the object
+   ObjectSetInteger(chart_ID,name,OBJPROP_SELECTABLE,selection);
+   ObjectSetInteger(chart_ID,name,OBJPROP_SELECTED,selection);
+//--- hide (true) or display (false) graphical object name in the object list
+   ObjectSetInteger(chart_ID,name,OBJPROP_HIDDEN,hidden);
+//--- set the priority for receiving the event of a mouse click in the chart
+   ObjectSetInteger(chart_ID,name,OBJPROP_ZORDER,z_order);
+//--- successful execution
+   return(true);
+  }
+
+// Timer function
+void OnTimer()
+  {
+   EventSetTimer(1);
+  }
+//+------------------------------------------------------------------+
+
+
